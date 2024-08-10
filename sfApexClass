@@ -2,8 +2,11 @@ public class SendBatchEmails {
 
     // Define a class to handle the input from Flow
     public class EmailDetails {
-        @InvocableVariable(required=true label='To Addresses List' description='List of recipient email addresses')
+        @InvocableVariable(label='To Addresses List' description='List of recipient email addresses')
         public List<String> toAddresses;  // List of recipient email addresses
+
+        @InvocableVariable(label='To Addresses Collection' description='List of records (Contacts, Cases, Campaign Members) whose emails will be sent to.')
+        public List<SObject> toAddressesCollection;  // List of SObjects (generic, can include Contacts, Cases, Campaign Members)
 
         @InvocableVariable(required=true label='Email Subject')
         public String subject;
@@ -25,32 +28,99 @@ public class SendBatchEmails {
 
         @InvocableVariable(label='Sender Type' description='Type of sender email. Options: CurrentUser, DefaultWorkflowUser, OrgWideEmailAddress.')
         public String senderType;  // Sender type (optional)
+
+        @InvocableVariable(label='Log Email Against Record' description='If true, logs the email as an activity against the appropriate record (e.g., Contact, Case, Campaign Member).')
+        public Boolean logEmailAgainstRecord;  // Flag to indicate if email should be logged (optional)
     }
 
     // Method to be called from Salesforce Flow
-    @InvocableMethod(label='Send Batch Emails' description='Sends an email to a list of recipients with customizable sender email, sender type, and the option to send as Plain Text or Rich Text, including CC and BCC.')
+    @InvocableMethod(label='Send Batch Emails' description='Sends an email to a list of recipients with customizable sender email, sender type, and the option to send as Plain Text or Rich Text, including CC and BCC. Optionally logs the email as an activity against the appropriate record.')
     public static void sendBatchEmails(List<EmailDetails> emailDetailsList) {
         // Process each email detail record
         for (EmailDetails details : emailDetailsList) {
-            sendEmail(details.toAddresses, details.subject, details.body, details.isRichText, details.ccAddresses, details.bccAddresses, details.senderEmailAddress, details.senderType);
+            sendAndLogEmails(details.toAddresses, details.toAddressesCollection, details.subject, details.body, details.isRichText, details.ccAddresses, details.bccAddresses, details.senderEmailAddress, details.senderType, details.logEmailAgainstRecord);
         }
     }
 
-    // Helper method to send an email
-    private static void sendEmail(List<String> toAddresses, String emailSubject, String emailBody, Boolean isRichText, List<String> ccAddresses, List<String> bccAddresses, String senderEmailAddress, String senderType) {
-        if (toAddresses == null || toAddresses.isEmpty()) {
-            return;  // Exit if no recipients are provided
+    // Helper method to send an email and log it as an EmailMessage against a Case
+    private static void sendAndLogEmails(List<String> toAddresses, List<SObject> toAddressesCollection, String emailSubject, String emailBody, Boolean isRichText, List<String> ccAddresses, List<String> bccAddresses, String senderEmailAddress, String senderType, Boolean logEmailAgainstRecord) {
+        // Combine To Addresses List and To Addresses Collection
+        if (toAddresses == null) {
+            toAddresses = new List<String>();
+        }
+        List<Id> caseIdsForLogging = new List<Id>();
+        if (toAddressesCollection != null && !toAddressesCollection.isEmpty()) {
+            for (SObject record : toAddressesCollection) {
+                if (record instanceof Contact) {
+                    Contact contact = (Contact)record;
+                    if (contact.Email != null) {
+                        toAddresses.add(contact.Email);
+                    }
+                } else if (record instanceof Case) {
+                    Case caseRecord = (Case)record;
+                    if (caseRecord.ContactId != null) {
+                        Contact contact = [SELECT Email FROM Contact WHERE Id = :caseRecord.ContactId LIMIT 1];
+                        if (contact.Email != null) {
+                            toAddresses.add(contact.Email);
+                            if (logEmailAgainstRecord == true) {
+                                caseIdsForLogging.add(caseRecord.Id);
+                            }
+                        }
+                    }
+                } else if (record instanceof CampaignMember) {
+                    CampaignMember campaignMember = (CampaignMember)record;
+                    if (campaignMember.ContactId != null) {
+                        Contact contact = [SELECT Email FROM Contact WHERE Id = :campaignMember.ContactId LIMIT 1];
+                        if (contact.Email != null) {
+                            toAddresses.add(contact.Email);
+                        }
+                    }
+                }
+            }
         }
 
+        // If no toAddresses are available after combining, throw an exception
+        if (toAddresses.isEmpty()) {
+            throw new EmailException('No valid email addresses found in either To Addresses List or To Addresses Collection.');
+        }
+
+        // Determine the sender's email address and name
+        String fromAddress = '';
+        String fromName = '';
+        if (senderType != null) {
+            if (senderType.equalsIgnoreCase('OrgWideEmailAddress') && senderEmailAddress != null) {
+                // Set the Org-Wide Email Address ID
+                OrgWideEmailAddress orgWideEmail = [SELECT Id, Address, DisplayName FROM OrgWideEmailAddress WHERE Address = :senderEmailAddress LIMIT 1];
+                if (orgWideEmail != null) {
+                    fromAddress = orgWideEmail.Address;
+                    fromName = orgWideEmail.DisplayName;
+                }
+            } else if (senderType.equalsIgnoreCase('DefaultWorkflowUser')) {
+                // Handle the Default Workflow User
+                fromAddress = senderEmailAddress != null ? senderEmailAddress : UserInfo.getUserEmail();
+                fromName = UserInfo.getName();
+            } else {
+                // Default to Current User
+                fromAddress = UserInfo.getUserEmail();
+                fromName = UserInfo.getName();
+            }
+        }
+
+        // Create and send the email
         Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
         mail.setToAddresses(toAddresses);
         mail.setSubject(emailSubject);
 
+        // Set the replyTo only if fromAddress is valid
+        if (fromAddress != null && fromAddress != '') {
+            mail.setReplyTo(fromAddress);
+        }
+
         // Set the body based on the format choice
+        String plainTextBody = stripHtmlTags(emailBody);  // Strip HTML tags for logging and plain text
         if (isRichText != null && isRichText == true) {
             mail.setHtmlBody(emailBody);  // Send as Rich Text (HTML)
         } else {
-            String plainTextBody = stripHtmlTags(emailBody);  // Strip HTML tags for plain text
             mail.setPlainTextBody(plainTextBody);  // Send as Plain Text
         }
 
@@ -64,29 +134,31 @@ public class SendBatchEmails {
             mail.setBccAddresses(bccAddresses);
         }
 
-        // Set the sender email and type
-        if (senderType != null) {
-            if (senderType.equalsIgnoreCase('OrgWideEmailAddress') && senderEmailAddress != null) {
-                // Set the Org-Wide Email Address ID
-                OrgWideEmailAddress orgWideEmail = [SELECT Id FROM OrgWideEmailAddress WHERE Address = :senderEmailAddress LIMIT 1];
-                if (orgWideEmail != null) {
-                    mail.setOrgWideEmailAddressId(orgWideEmail.Id);
-                }
-            } else if (senderType.equalsIgnoreCase('DefaultWorkflowUser')) {
-                // Handle the Default Workflow User; typically this isn't configurable via Apex directly.
-                // If you need to set the sender's email address, consider setting it to a known email address.
-                mail.setReplyTo(senderEmailAddress != null ? senderEmailAddress : UserInfo.getUserEmail());
-            } 
-            // CurrentUser is the default, so no need to handle it explicitly
-        }
-
-        // Set Reply-To address if specified and not using OrgWideEmailAddress
-        if (senderEmailAddress != null && !senderType.equalsIgnoreCase('OrgWideEmailAddress')) {
-            mail.setReplyTo(senderEmailAddress);
-        }
-
         // Send the email
         Messaging.sendEmail(new Messaging.SingleEmailMessage[] { mail });
+
+        // Optionally log the email as an EmailMessage for each Case
+        if (logEmailAgainstRecord == true && !caseIdsForLogging.isEmpty()) {
+            List<EmailMessage> emailMessages = new List<EmailMessage>();
+            for (Id caseId : caseIdsForLogging) {
+                EmailMessage em = new EmailMessage(
+                    BccAddress = bccAddresses != null ? String.join(bccAddresses, ',') : null,
+                    CcAddress = ccAddresses != null ? String.join(ccAddresses, ',') : null,
+                    FromAddress = fromAddress != null && fromAddress != '' ? fromAddress : UserInfo.getUserEmail(), // Fallback to User Email if fromAddress is empty
+                    FromName = fromName != null && fromName != '' ? fromName : UserInfo.getName(), // Fallback to User Name if fromName is empty
+                    HtmlBody = isRichText != null && isRichText == true ? emailBody : null,
+                    MessageDate = DateTime.now(),
+                    RelatedToId = caseId,
+                    Subject = emailSubject,
+                    TextBody = isRichText != null && isRichText == false ? plainTextBody : emailBody, // If not rich text, use plain text; otherwise, fallback to original content
+                    ToAddress = String.join(toAddresses, ',')
+                );
+                emailMessages.add(em);
+            }
+            if (!emailMessages.isEmpty()) {
+                insert emailMessages;
+            }
+        }
     }
 
     // Utility method to strip HTML tags
@@ -97,4 +169,7 @@ public class SendBatchEmails {
         // Remove HTML tags
         return htmlText.replaceAll('<[^>]*>', '');
     }
+
+    // Custom exception class for email errors
+    public class EmailException extends Exception {}
 }
