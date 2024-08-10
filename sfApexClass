@@ -1,0 +1,100 @@
+public class SendBatchEmails {
+
+    // Define a class to handle the input from Flow
+    public class EmailDetails {
+        @InvocableVariable(required=true label='To Addresses List' description='List of recipient email addresses')
+        public List<String> toAddresses;  // List of recipient email addresses
+
+        @InvocableVariable(required=true label='Email Subject')
+        public String subject;
+
+        @InvocableVariable(required=true label='Email Body')
+        public String body;
+
+        @InvocableVariable(label='Send as Rich Text' description='If true, sends the email as Rich Text (HTML). If false or empty, sends as Plain Text.')
+        public Boolean isRichText;  // Boolean flag to determine email format (optional)
+
+        @InvocableVariable(label='CC Addresses List' description='List of CC email addresses')
+        public List<String> ccAddresses;  // List of CC email addresses (optional)
+
+        @InvocableVariable(label='BCC Addresses List' description='List of BCC email addresses')
+        public List<String> bccAddresses;  // List of BCC email addresses (optional)
+
+        @InvocableVariable(label='Sender Email Address' description='Custom sender email address. Leave empty for default.')
+        public String senderEmailAddress;  // Custom sender email address (optional)
+
+        @InvocableVariable(label='Sender Type' description='Type of sender email. Options: CurrentUser, DefaultWorkflowUser, OrgWideEmailAddress.')
+        public String senderType;  // Sender type (optional)
+    }
+
+    // Method to be called from Salesforce Flow
+    @InvocableMethod(label='Send Batch Emails' description='Sends an email to a list of recipients with customizable sender email, sender type, and the option to send as Plain Text or Rich Text, including CC and BCC.')
+    public static void sendBatchEmails(List<EmailDetails> emailDetailsList) {
+        // Process each email detail record
+        for (EmailDetails details : emailDetailsList) {
+            sendEmail(details.toAddresses, details.subject, details.body, details.isRichText, details.ccAddresses, details.bccAddresses, details.senderEmailAddress, details.senderType);
+        }
+    }
+
+    // Helper method to send an email
+    private static void sendEmail(List<String> toAddresses, String emailSubject, String emailBody, Boolean isRichText, List<String> ccAddresses, List<String> bccAddresses, String senderEmailAddress, String senderType) {
+        if (toAddresses == null || toAddresses.isEmpty()) {
+            return;  // Exit if no recipients are provided
+        }
+
+        Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
+        mail.setToAddresses(toAddresses);
+        mail.setSubject(emailSubject);
+
+        // Set the body based on the format choice
+        if (isRichText != null && isRichText == true) {
+            mail.setHtmlBody(emailBody);  // Send as Rich Text (HTML)
+        } else {
+            String plainTextBody = stripHtmlTags(emailBody);  // Strip HTML tags for plain text
+            mail.setPlainTextBody(plainTextBody);  // Send as Plain Text
+        }
+
+        // Set CC addresses if provided
+        if (ccAddresses != null && !ccAddresses.isEmpty()) {
+            mail.setCcAddresses(ccAddresses);
+        }
+
+        // Set BCC addresses if provided
+        if (bccAddresses != null && !bccAddresses.isEmpty()) {
+            mail.setBccAddresses(bccAddresses);
+        }
+
+        // Set the sender email and type
+        if (senderType != null) {
+            if (senderType.equalsIgnoreCase('OrgWideEmailAddress') && senderEmailAddress != null) {
+                // Set the Org-Wide Email Address ID
+                OrgWideEmailAddress orgWideEmail = [SELECT Id FROM OrgWideEmailAddress WHERE Address = :senderEmailAddress LIMIT 1];
+                if (orgWideEmail != null) {
+                    mail.setOrgWideEmailAddressId(orgWideEmail.Id);
+                }
+            } else if (senderType.equalsIgnoreCase('DefaultWorkflowUser')) {
+                // Handle the Default Workflow User; typically this isn't configurable via Apex directly.
+                // If you need to set the sender's email address, consider setting it to a known email address.
+                mail.setReplyTo(senderEmailAddress != null ? senderEmailAddress : UserInfo.getUserEmail());
+            } 
+            // CurrentUser is the default, so no need to handle it explicitly
+        }
+
+        // Set Reply-To address if specified and not using OrgWideEmailAddress
+        if (senderEmailAddress != null && !senderType.equalsIgnoreCase('OrgWideEmailAddress')) {
+            mail.setReplyTo(senderEmailAddress);
+        }
+
+        // Send the email
+        Messaging.sendEmail(new Messaging.SingleEmailMessage[] { mail });
+    }
+
+    // Utility method to strip HTML tags
+    private static String stripHtmlTags(String htmlText) {
+        if (htmlText == null) {
+            return null;
+        }
+        // Remove HTML tags
+        return htmlText.replaceAll('<[^>]*>', '');
+    }
+}
