@@ -17,44 +17,52 @@ public class SendBatchEmails {
         @InvocableVariable(label='Send as Rich Text' description='If true, sends the email as Rich Text (HTML). If false or empty, sends as Plain Text.')
         public Boolean isRichText;  // Boolean flag to determine email format (optional)
 
-        @InvocableVariable(label='CC Addresses List' description='List of CC email addresses')
+        @InvocableVariable(label='CC Addresses List' description='A text collection of CC email recipients.')
         public List<String> ccAddresses;  // List of CC email addresses (optional)
 
-        @InvocableVariable(label='BCC Addresses List' description='List of BCC email addresses')
+        @InvocableVariable(label='BCC Addresses List' description='A text collection of BCC email recipients.')
         public List<String> bccAddresses;  // List of BCC email addresses (optional)
 
-        @InvocableVariable(label='Sender Email Address' description='Custom sender email address. Leave empty for default.')
+        @InvocableVariable(label='Sender Email Address' description='The email address of the sender. If completed, Sender Type should also be completed.')
         public String senderEmailAddress;  // Custom sender email address (optional)
 
-        @InvocableVariable(label='Sender Type' description='Type of sender email. Options: CurrentUser, DefaultWorkflowUser, OrgWideEmailAddress.')
+        @InvocableVariable(label='Sender Type' description='If used please input one of the following: CurrentUser, DefaultWorkflowUser, or OrgWideEmailAddress.')
         public String senderType;  // Sender type (optional)
 
         @InvocableVariable(label='Log Email Against Record' description='If true, logs the email as an activity against the appropriate record (e.g., Contact, Case, Campaign Member).')
         public Boolean logEmailAgainstRecord;  // Flag to indicate if email should be logged (optional)
+
+        @InvocableVariable(label='File IDs' description='A record collection of ContentDocument records. These files will be attached to each email sent via the Apex Class.')
+        public List<Id> fileIds;  // List of ContentDocument IDs to attach to the email (optional)
     }
 
     // Method to be called from Salesforce Flow
-    @InvocableMethod(label='Send Batch Emails' description='Sends an email to a list of recipients with customizable sender email, sender type, and the option to send as Plain Text or Rich Text, including CC and BCC. Optionally logs the email as an activity against the appropriate record.')
+    @InvocableMethod(label='Send Batch Emails' description='Sends an email to a list of recipients with customizable sender email, sender type, and the option to send as Plain Text or Rich Text, including CC and BCC. Optionally logs the email as an activity against the appropriate record. Note: Admins must complete the Object for "To Addresses Collection" (Input) parameter even if they do not plan to use one. This is currently a limitation of Flow Builder')
     public static void sendBatchEmails(List<EmailDetails> emailDetailsList) {
         // Process each email detail record
         for (EmailDetails details : emailDetailsList) {
-            sendAndLogEmails(details.toAddresses, details.toAddressesCollection, details.subject, details.body, details.isRichText, details.ccAddresses, details.bccAddresses, details.senderEmailAddress, details.senderType, details.logEmailAgainstRecord);
+            sendAndLogEmails(details.toAddresses, details.toAddressesCollection, details.subject, details.body, details.isRichText, details.ccAddresses, details.bccAddresses, details.senderEmailAddress, details.senderType, details.logEmailAgainstRecord, details.fileIds);
         }
     }
 
-    // Helper method to send an email and log it as an EmailMessage against a Case
-    private static void sendAndLogEmails(List<String> toAddresses, List<SObject> toAddressesCollection, String emailSubject, String emailBody, Boolean isRichText, List<String> ccAddresses, List<String> bccAddresses, String senderEmailAddress, String senderType, Boolean logEmailAgainstRecord) {
+    // Helper method to send an email and log it as an EmailMessage against a Case or Task against Contacts/Campaign Members
+    private static void sendAndLogEmails(List<String> toAddresses, List<SObject> toAddressesCollection, String emailSubject, String emailBody, Boolean isRichText, List<String> ccAddresses, List<String> bccAddresses, String senderEmailAddress, String senderType, Boolean logEmailAgainstRecord, List<Id> fileIds) {
         // Combine To Addresses List and To Addresses Collection
         if (toAddresses == null) {
             toAddresses = new List<String>();
         }
+        List<Id> contactIdsForLogging = new List<Id>();
         List<Id> caseIdsForLogging = new List<Id>();
+
         if (toAddressesCollection != null && !toAddressesCollection.isEmpty()) {
             for (SObject record : toAddressesCollection) {
                 if (record instanceof Contact) {
                     Contact contact = (Contact)record;
                     if (contact.Email != null) {
                         toAddresses.add(contact.Email);
+                        if (logEmailAgainstRecord == true) {
+                            contactIdsForLogging.add(contact.Id);
+                        }
                     }
                 } else if (record instanceof Case) {
                     Case caseRecord = (Case)record;
@@ -73,6 +81,9 @@ public class SendBatchEmails {
                         Contact contact = [SELECT Email FROM Contact WHERE Id = :campaignMember.ContactId LIMIT 1];
                         if (contact.Email != null) {
                             toAddresses.add(contact.Email);
+                            if (logEmailAgainstRecord == true) {
+                                contactIdsForLogging.add(contact.Id);
+                            }
                         }
                     }
                 }
@@ -134,12 +145,44 @@ public class SendBatchEmails {
             mail.setBccAddresses(bccAddresses);
         }
 
+        // Add file attachments if provided
+        if (fileIds != null && !fileIds.isEmpty()) {
+            List<Messaging.EmailFileAttachment> attachments = new List<Messaging.EmailFileAttachment>();
+            for (Id fileId : fileIds) {
+                ContentVersion contentVersion = [SELECT VersionData, Title, FileExtension FROM ContentVersion WHERE ContentDocumentId = :fileId ORDER BY VersionNumber DESC LIMIT 1];
+                if (contentVersion != null) {
+                    Messaging.EmailFileAttachment attachment = new Messaging.EmailFileAttachment();
+                    attachment.setFileName(contentVersion.Title + '.' + contentVersion.FileExtension);
+                    attachment.setBody(contentVersion.VersionData);
+                    attachments.add(attachment);
+                }
+            }
+            mail.setFileAttachments(attachments);
+        }
+
         // Send the email
         Messaging.sendEmail(new Messaging.SingleEmailMessage[] { mail });
 
-        // Optionally log the email as an EmailMessage for each Case
-        if (logEmailAgainstRecord == true && !caseIdsForLogging.isEmpty()) {
+        // Optionally log the email as an EmailMessage for Cases or a Task for Contacts/Campaign Members
+        if (logEmailAgainstRecord == true) {
             List<EmailMessage> emailMessages = new List<EmailMessage>();
+            List<Task> tasks = new List<Task>();
+
+            // Log against Contacts (as Task)
+            for (Id contactId : contactIdsForLogging) {
+                Task task = new Task(
+                    WhoId = contactId,
+                    Subject = 'Email: ' + emailSubject,
+                    Description = plainTextBody,
+                    Status = 'Completed',
+                    Priority = 'Normal',
+                    ActivityDate = Date.today(),
+                    Type = 'Email'
+                );
+                tasks.add(task);
+            }
+
+            // Log against Cases (as EmailMessage)
             for (Id caseId : caseIdsForLogging) {
                 EmailMessage em = new EmailMessage(
                     BccAddress = bccAddresses != null ? String.join(bccAddresses, ',') : null,
@@ -154,6 +197,11 @@ public class SendBatchEmails {
                     ToAddress = String.join(toAddresses, ',')
                 );
                 emailMessages.add(em);
+            }
+
+            // Insert Tasks and EmailMessages
+            if (!tasks.isEmpty()) {
+                insert tasks;
             }
             if (!emailMessages.isEmpty()) {
                 insert emailMessages;
